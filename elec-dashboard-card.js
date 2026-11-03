@@ -1,5 +1,5 @@
 /**
- * 国家电网电费卡组  v1.2.0
+ * 国家电网电费卡组  v1.2.5
  * Home Assistant 自定义卡片，单文件包含三张卡：
  *   custom:elec-summary-card  电费概览（多户号 · 阶梯电价）
  *   custom:elec-chart-card    日/月用电柱状趋势图
@@ -62,7 +62,20 @@ const BASE_CSS = `
 .info{margin-top:7px;line-height:1.55}
 .lab{font-size:12px;color:var(--elec-muted)}
 .no{color:var(--elec-blue);font-weight:700;font-size:14px;white-space:nowrap}
-.date{font-size:11.5px;color:var(--elec-muted)}
+.date{font-size:11.5px;color:var(--elec-muted);display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  line-height:1.9;margin-top:1px}
+.date .t{font-variant-numeric:tabular-nums;letter-spacing:.1px}
+.rf{display:inline-flex;align-items:center;gap:3px;font-family:inherit;font-size:11px;line-height:1.5;
+  padding:0 7px 0 5px;border-radius:999px;cursor:pointer;background:transparent;
+  color:var(--elec-blue);border:1px solid rgba(59,123,255,.32);opacity:.88;
+  transition:background .16s,border-color .16s,opacity .16s}
+.rf:hover:not(:disabled){background:rgba(59,123,255,.13);border-color:rgba(59,123,255,.62);opacity:1}
+.rf:disabled{cursor:default;opacity:.75}
+.rf .ico{width:10px;height:10px;flex:none;transform-origin:50% 50%}
+.rf.busy .ico{animation:rfspin .9s linear infinite}
+@keyframes rfspin{to{transform:rotate(360deg)}}
+.hint{font-size:11px;color:var(--elec-accent);opacity:.95}
+.ver{margin-left:auto;font-size:10px;opacity:.32;letter-spacing:.3px}
 .stats{display:flex;margin-top:8px}
 .stat{flex:1;text-align:center}
 .num{font-size:24px;font-weight:700;line-height:1.1}
@@ -104,7 +117,12 @@ function setAccount(key) {
   window.dispatchEvent(new CustomEvent(ACCOUNT_EVENT, { detail: key }));
 }
 
-const VERSION = "v1.2.0";
+const VERSION = "v1.2.5";
+
+/* 刷新按钮里的小图标（环形箭头），随按钮文字同色 */
+const RF_ICON = `<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+  stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M20.5 12a8.5 8.5 0 1 1-2.49-6.01"/><path d="M20.5 3.6v5h-5"/></svg>`;
 
 function accNumber(acc, hass) {
   // YAML 会把 no: 解析成布尔 false，这里兼容所有可能写法
@@ -187,6 +205,40 @@ function lastUpdated(hass, entity) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/**
+ * 当前本地时刻，格式与 refresh_time 一致（"2026-11-03 12:28:33"）。
+ * 用于「卡片本次同步时间」。
+ */
+function nowStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 推导「上次抓数时间」对应的实体：优先用配置里显式给的 refresh_time，
+ * 否则把 current_year_charge 的实体名（..._year_ele_cost）里的字段段换掉。
+ */
+function refreshEntityOf(acc) {
+  const base = sensorOf(acc, "current_year_charge");
+  return (
+    (acc.entities && acc.entities.refresh_time) ||
+    base.replace(/_year_ele_cost$/, "_refresh_time") ||
+    base.replace(/_[^_]+$/, "_refresh_time")
+  );
+}
+
+/**
+ * 取「上次抓数时间」：优先用集成提供的 refresh_time 传感器（值本身就是
+ * "2026-11-03 11:11:34" 这种本地时间字符串），取不到再退回实体 last_updated。
+ * refresh_time 的实体名由 current_year_charge 的实体名推导，无需改卡片配置。
+ */
+function refreshedAt(hass, acc) {
+  const s = hass.states[refreshEntityOf(acc)];
+  if (s && s.state && s.state !== "unknown" && s.state !== "unavailable") return s.state;
+  return lastUpdated(hass, sensorOf(acc, "current_year_charge"));
+}
+
 /* ---------------- 卡片一：电费概览 ---------------- */
 
 class ElecSummaryCard extends HTMLElement {
@@ -225,6 +277,7 @@ class ElecSummaryCard extends HTMLElement {
     return [
       acc.key,
       this._tab,
+      this._hass.states[refreshEntityOf(acc)]?.state ?? "",
       ...["current_year_charge", "current_year_usage", "current_month_usage",
         "previous_daily_usage", "previous_settled_month_usage", "previous_settled_month_charge"]
         .map((s) => this._hass.states[sensorOf(acc, s)]?.state ?? ""),
@@ -262,6 +315,13 @@ class ElecSummaryCard extends HTMLElement {
     const cur = views[this._tab];
     const region = this._config.region === "" ? "" : (this._config.region || "甘肃 · 金昌");
 
+    // 「数据更新」显示哪个时间：
+    //  - 平时显示集成上次抓数时间（数据真实新鲜度）
+    //  - 点过刷新且集成数据没变 → 显示卡片本次同步时刻，让时间跟着走
+    //  - 一旦集成真抓到新数据（refresh_time 变了）→ 自动退回显示新抓数时间
+    const integ = refreshedAt(hass, acc);
+    const shownAt = this._syncAt && this._syncBase === integ ? this._syncAt : integ;
+
     const pills = this._config.accounts
       .map((a) => `<div class="pill${a.key === acc.key ? " on" : ""}" data-key="${a.key}">${a.name}</div>`)
       .join("");
@@ -285,7 +345,7 @@ class ElecSummaryCard extends HTMLElement {
 
         <div class="info">
           <div><span class="lab">电费户号：</span><span class="no">${accNumber(acc, hass)}</span></div>
-          <div class="date">数据日期：${lastUpdated(hass, sensorOf(acc, "current_year_charge"))}<span style="opacity:.45;font-size:11px;margin-left:6px">${VERSION}</span></div>
+          <div class="date">数据更新：<span class="t" title="集成抓数时间：${integ}">${shownAt}</span><button class="rf${this._busy ? " busy" : ""}" ${this._busy ? "disabled" : ""} title="重新读取集成数据（不重新抓取）">${RF_ICON}<span>${this._busy ? "同步中" : "刷新"}</span></button>${this._hint ? `<span class="hint">${this._hint}</span>` : ""}<span class="ver">${VERSION}</span></div>
         </div>
 
         <div class="stats">
@@ -326,6 +386,8 @@ class ElecSummaryCard extends HTMLElement {
     this.shadowRoot.querySelectorAll(".pill").forEach((el) => {
       el.addEventListener("click", () => {
         setAccount(el.dataset.key);
+        this._syncAt = null;
+        this._syncBase = null;
         this._render();
       });
     });
@@ -336,7 +398,44 @@ class ElecSummaryCard extends HTMLElement {
       });
     });
 
+    const rf = this.shadowRoot.querySelector(".rf");
+    if (rf) rf.addEventListener("click", () => this._refresh());
+
+    this._acc = acc;
     this._sig = this._signature();
+  }
+
+  /**
+   * 点「刷新」：只重新读取 HA 里「集成已经抓回来的数据」并重绘卡片，
+   * 不发起任何向国网的请求（真正的抓数仍由集成按自己的周期跑）。
+   * 也就是把卡片显示与集成当前数据强制对齐一次。
+   */
+  _refresh() {
+    if (this._busy || !this._hass || !this._acc) return;
+    this._busy = true;
+    this._hint = "";
+    this._sig = null;
+    this._render();
+
+    // HA 的 state 推送本身是实时的；这里只是忽略签名缓存、
+    // 按当前 hass.states 重新渲染一遍，不做任何网络请求。
+    setTimeout(() => {
+      if (!this.isConnected) return;
+      // 记下此刻集成数据的抓数时间，并把「数据更新」推进到本次同步时刻；
+      // 之后集成真抓到新数据时，显示的会自动换回新的抓数时间。
+      this._syncBase = refreshedAt(this._hass, this._acc);
+      this._syncAt = nowStamp();
+      this._busy = false;
+      this._hint = "已同步";
+      this._sig = null;
+      this._render();
+      setTimeout(() => {
+        if (!this.isConnected) return;
+        this._hint = "";
+        this._sig = null;
+        this._render();
+      }, 3200);
+    }, 300);
   }
 }
 
